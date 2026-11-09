@@ -33,9 +33,21 @@ Five components; only `ui` and `api` have public routes.
   the transcript.
 - **One provider per build.** `build.mjs` resolves `#llm-provider` to
   `src/llm/$LLM_PROVIDER.ts`; the agent loop only uses the `LlmProvider` interface in
-  `src/llm/types.ts`. Keep provider SDK imports inside `src/llm/<provider>.ts`.
+  `src/llm/types.ts`. Keep provider SDK imports inside `src/llm/<provider>.ts`. Within
+  that one provider, each `src/llm/<provider>.ts` also exports `listModels()`, used by
+  `GET /api/models` to report the model ids the configured server actually serves; the UI
+  populates each of its 1-2 panes' (user-chosen via "Compare" buttons) dropdowns from that
+  list and pins its `/api/chat`
+  request to the chosen id via `model` in the body, passed straight through to
+  `createProvider(modelOverride)`. This is a model-id choice, not a second SDK/provider
+  format. There is no `model` Spin variable: a missing or empty `model` in the request
+  falls back to a hardcoded default in `createProvider` (`claude-opus-4-8` /
+  `gpt-5`), not a configurable one.
 - **Model output is untrusted.** The UI renders it with `html: false`, link-scheme
   allowlisting, and registered-language-only highlighting. Don't loosen that.
+- **`access_token` is required, not optional.** It is `required = true` in `spin.toml`
+  (no default), so `spin up`/deploy fails fast without `SPIN_VARIABLE_ACCESS_TOKEN` set,
+  rather than silently serving an open instance. Don't reintroduce an empty default.
 
 ## Build and run
 
@@ -44,6 +56,7 @@ separately.
 
 ```bash
 export SPIN_VARIABLE_MODEL_BASE_URL=<model-base-url> SPIN_VARIABLE_MODEL_API_KEY=<api-key>
+export SPIN_VARIABLE_ACCESS_TOKEN=<secret>
 spin up --build                    # Anthropic Messages API; builds all 5 components + serves
 spin up --profile openai --build   # OpenAI Chat Completions API
 ```

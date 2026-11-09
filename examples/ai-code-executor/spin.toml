@@ -13,17 +13,15 @@ log_level = { default = "info" }
 # picks the API format: Anthropic Messages by default, OpenAI Chat Completions with `--profile openai`.
 model_base_url = { required = true }
 model_api_key = { default = "", secret = true }
-# Empty = the provider's default model.
-model = { default = "" }
 # Origin of the esm.sh server used by the experimental bundler. Defaults to the public
 # https://esm.sh; to self-host, see https://github.com/esm-dev/esm.sh/blob/main/HOSTING.md and set
 # SPIN_VARIABLE_ESM_BASE_URL=https://esm.example.com
 esm_base_url = { default = "https://esm.sh" }
 ts_interpreter_url = { default = "http://ts-sandbox.spin.internal" }
 bundler_url = { default = "http://bundler.spin.internal" }
-# Shared access token gating the UI + API. Empty = no gate (local dev); set to enable:
-# SPIN_VARIABLE_ACCESS_TOKEN=some-secret
-access_token = { default = "", secret = true }
+# Shared access token gating the UI + API: required, so the app never starts open to
+# anyone who can reach it. SPIN_VARIABLE_ACCESS_TOKEN=some-secret
+access_token = { required = true, secret = true }
 
 [[trigger.http]]
 route = "/..."
@@ -53,7 +51,6 @@ allowed_outbound_hosts = [
 log_level = "{{ log_level }}"
 model_base_url = "{{ model_base_url }}"
 model_api_key = "{{ model_api_key }}"
-model = "{{ model }}"
 ts_interpreter_url = "{{ ts_interpreter_url }}"
 bundler_url = "{{ bundler_url }}"
 access_token = "{{ access_token }}"

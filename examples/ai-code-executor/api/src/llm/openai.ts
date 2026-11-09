@@ -37,11 +37,26 @@ interface PendingCall {
 const TEXT_BLOCK = 0;
 const toolBlock = (index: number) => index + 1;
 
-export function createProvider(): LlmProvider {
+// Lists the model ids the server behind `model_base_url` can serve, so the UI can populate a
+// model picker instead of hardcoding ids. Uses the same base URL/key as `createProvider`.
+export async function listModels(): Promise<string[]> {
+  const baseUrl = (variables.get("model_base_url") ?? "").replace(/\/+$/, "");
+  const client = new OpenAI({
+    apiKey: variables.get("model_api_key") || "unset",
+    baseURL: baseUrl + "/v1",
+  });
+  const ids: string[] = [];
+  for await (const m of client.models.list()) ids.push(m.id);
+  return ids.sort();
+}
+
+export function createProvider(modelOverride?: string): LlmProvider {
   // model_base_url is an origin (it doubles as the outbound allow-list entry, which takes no
   // path); the Chat Completions API lives under /v1 on OpenAI and compatible servers.
   const baseUrl = (variables.get("model_base_url") ?? "").replace(/\/+$/, "");
-  const model = variables.get("model") || "gpt-5";
+  // `modelOverride` lets a caller pick the model per call (the UI always sends one, chosen
+  // from GET /api/models); a direct API caller that omits it gets this hardcoded default.
+  const model = modelOverride || "gpt-5";
   const client = new OpenAI({
     // Local OpenAI-compatible servers ignore the key, but the SDK requires a value.
     apiKey: variables.get("model_api_key") || "unset",

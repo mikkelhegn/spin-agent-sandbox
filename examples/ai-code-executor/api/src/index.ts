@@ -3,15 +3,18 @@
 // The model is given one tool: it runs code in the fast Wasm interpreter. The
 // model writes the code, we execute it through @spinframework/sandbox and feed
 // the result back. The full transcript (reasoning + each tool call + output +
-// answer) is streamed to the UI. The LLM provider (Anthropic or OpenAI) is chosen
-// at build time; see build.mjs.
+// answer) is streamed to the UI. The LLM provider API format (Anthropic or OpenAI)
+// is chosen at build time; see build.mjs. Within that, the UI runs two independent
+// conversations side by side, each pinned to a model id of the caller's choice (from
+// the list GET /api/models reports); the chosen model id is streamed back to the UI
+// so it can tag the response with it.
 
 import { Hono } from "hono";
 import { fire } from "hono/service-worker";
 import { getCookie, setCookie } from "hono/cookie";
 import type { Context } from "hono";
 import * as variables from "@spinframework/spin-variables";
-import { createProvider } from "#llm-provider";
+import { createProvider, listModels } from "#llm-provider";
 
 import { Interpreter, type Language } from "@spinframework/sandbox/interpreter";
 import type { HttpInput } from "@spinframework/sandbox/core";
@@ -31,6 +34,9 @@ function systemPrompt(): string {
 }
 
 type WireEvent =
+  // Which model this turn's conversation is running on (the pinned one, or the provider's
+  // default), sent once before any other event so the UI can tag the response with it.
+  | { t: "model"; model: string }
   // An incremental slice of the model's text, streamed as it is generated.
   // `block` groups the deltas of one text block (unique within an assistant turn).
   | { t: "text_delta"; block: string; text: string }
@@ -46,7 +52,9 @@ type WireEvent =
       genMs: number;
     }
   | { t: "tool_end"; id: number; execMs: number; stdout: string; stderr: string; error: string | null }
-  | { t: "done"; history: History }
+  // Token usage summed across every model turn it took to answer this one prompt (an
+  // agentic run can take several turns when the model calls the tool more than once).
+  | { t: "done"; history: History; usage: { input: number; output: number } }
   | { t: "error"; error: string };
 
 type Emit = (e: WireEvent) => void;
@@ -67,8 +75,9 @@ function formatToolResult(stdout: string, stderr: string, error: string | null):
 // can render turn by turn (the code the moment the model writes it, then the
 // output the moment the sandbox returns) instead of waiting for the whole
 // transcript.
-async function runAgent(prompt: string, history: unknown, emit: Emit): Promise<void> {
-  const llm = createProvider();
+async function runAgent(prompt: string, history: unknown, emit: Emit, pinnedModel?: string): Promise<void> {
+  const llm = createProvider(pinnedModel);
+  emit({ t: "model", model: llm.model });
   const tsUrl = variables.get("ts_interpreter_url") ?? "http://ts-sandbox.spin.internal";
   const pyUrl = variables.get("py_interpreter_url") ?? "http://py-sandbox.spin.internal";
   const bundlerUrl = variables.get("bundler_url") ?? "http://bundler.spin.internal";
@@ -86,7 +95,10 @@ async function runAgent(prompt: string, history: unknown, emit: Emit): Promise<v
   // Continue the conversation: prior turns + the new user message.
   const messages = historyFor(llm, history);
   messages.push(llm.userMessage(prompt));
-  const done = () => emit({ t: "done", history: { provider: llm.name, items: messages } });
+  let totalInput = 0;
+  let totalOutput = 0;
+  const done = () =>
+    emit({ t: "done", history: { provider: llm.name, items: messages }, usage: { input: totalInput, output: totalOutput } });
   let toolId = 0;
 
   // Agentic loop: let the model call the sandbox tool until it produces a final answer.
@@ -101,6 +113,8 @@ async function runAgent(prompt: string, history: unknown, emit: Emit): Promise<v
       { onText: (block, text) => emit({ t: "text_delta", block: `${turn}-${block}`, text }) },
     );
     const genMs = Date.now() - genStart;
+    totalInput += res.usage.input;
+    totalOutput += res.usage.output;
     log.info(`generate: turn=${turn} ${genMs}ms stop=${res.stop} in=${res.usage.input} out=${res.usage.output}`);
 
     const toolResults: ToolResult[] = [];
@@ -197,9 +211,10 @@ app.use(async (c: Context, next) => {
 });
 
 // ---- access-token gate ----
-// If the `access_token` variable is set, every route except health/auth requires a matching
-// `app_token` cookie (set by POST /api/auth). An empty token disables the gate: fine for local
-// dev, but then anyone who can reach the app can spend the model key.
+// `access_token` is a required Spin variable (see spin.toml), so every deployment sets one:
+// every route except health/auth requires a matching `app_token` cookie (set by
+// POST /api/auth). The empty-string check below is a defense-in-depth fallback only (e.g. if
+// it were ever explicitly set to ""), not the expected path.
 const AUTH_COOKIE = "app_token";
 const accessToken = () => (variables.get("access_token") ?? "").trim();
 
@@ -244,6 +259,18 @@ app.get("/api/health", (c: Context) => {
   });
 });
 
+// Lists the models the configured server can serve, so the UI can populate a picker
+// instead of hardcoding ids.
+app.get("/api/models", async (c: Context) => {
+  try {
+    const models = await listModels();
+    return c.json({ models });
+  } catch (e: any) {
+    log.error(`models: ${e?.stack ?? e}`);
+    return c.json({ error: "could not list models" }, 502);
+  }
+});
+
 // Validate the access token and, on success, set the gate cookie.
 app.post("/api/auth", async (c: Context) => {
   const token = accessToken();
@@ -274,10 +301,17 @@ app.post("/api/chat", async (c: Context) => {
   }
   let prompt = "";
   let history: unknown = null;
+  let pinnedModel: string | undefined;
   try {
-    const body = await c.req.json<{ prompt?: string; history?: unknown }>();
+    const body = await c.req.json<{ prompt?: string; history?: unknown; model?: string }>();
     prompt = (body.prompt ?? "").trim();
     history = body.history ?? null;
+    // The split-screen UI pins each side to a model id it got from GET /api/models, so the
+    // same prompt runs on both, independently, for a direct comparison. Without one, the
+    // provider falls back to its own default, which keeps the endpoint usable for direct
+    // API callers that only want one answer.
+    const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+    pinnedModel = requestedModel || undefined;
   } catch {
     return c.json({ error: "expected JSON body { prompt: string }" }, 400);
   }
@@ -290,7 +324,7 @@ app.post("/api/chat", async (c: Context) => {
     async start(controller) {
       const emit: Emit = (e) => controller.enqueue(encoder.encode(JSON.stringify(e) + "\n"));
       try {
-        await runAgent(prompt, history, emit);
+        await runAgent(prompt, history, emit, pinnedModel);
       } catch (e: any) {
         log.error(`agent error: ${e?.stack ?? e}`);
         emit({ t: "error", error: String(e?.message ?? e) });

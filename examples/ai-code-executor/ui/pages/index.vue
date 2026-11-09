@@ -20,73 +20,135 @@
 
   <div v-else-if="gate === 'open'" class="app">
     <header class="topbar">
-      <div class="brand"><span class="logo">AI Code Executor</span><span class="tag">writes code · runs it in a Wasm sandbox</span></div>
+      <div class="brand"><span class="logo">AI Code Executor</span><span class="tag">writes code · runs it in a Wasm sandbox · compares up to three models side by side</span></div>
       <div class="actions">
+        <!-- Shared token budget: every pane's usage counts against the same pot. It
+             survives "New Chat" (which only clears the conversations); the Reset
+             button here is the only thing that refills it. -->
+        <div class="budget" :class="{ over: budgetExhausted }" :title="`input + output tokens across all panes, out of a ${fmtTokens(TOKEN_BUDGET)}-token budget`">
+          <span class="budget-label">Budget</span>
+          <span class="budget-bar"><span class="budget-fill" :style="{ width: budgetPct + '%' }"></span></span>
+          <span class="budget-nums">{{ fmtTokens(budgetUsed) }} / {{ fmtTokens(TOKEN_BUDGET) }}</span>
+          <button class="ghost budget-reset" :disabled="anyLoading || budgetUsed === 0" @click="resetBudget">Reset</button>
+        </div>
         <button class="ghost" @click="showHelp = true">How it works</button>
         <button class="ghost" @click="reset">New Chat</button>
       </div>
     </header>
 
-    <main class="scroll" ref="scrollEl">
+    <!-- Pick how many models (1-2) and which ones to compare, up front: visible before the
+         first prompt too, not just once the split panes exist. Locked once the comparison
+         has a first message; "New Chat" unlocks it again. -->
+    <div class="model-bar">
+      <div class="lane-count">
+        <span class="lane-count-label">Compare</span>
+        <button
+          v-for="n in [1, 2]"
+          :key="n"
+          type="button"
+          class="count-btn"
+          :class="{ active: laneCount === n }"
+          :disabled="anyLoading || hasStarted"
+          :title="hasStarted ? 'Start a New Chat to change this' : ''"
+          @click="setLaneCount(n)"
+        >
+          {{ n }}
+        </button>
+      </div>
+      <select
+        v-for="lane in lanes"
+        :key="lane.id"
+        class="model-select"
+        :class="laneClass(lane.id)"
+        v-model="lane.model"
+        :disabled="anyLoading || hasStarted || !availableModels.length"
+        :title="hasStarted ? 'Start a New Chat to change this' : ''"
+      >
+        <option v-if="!availableModels.length" value="">{{ modelsError || "Loading models…" }}</option>
+        <option v-for="m in availableModels" :key="m" :value="m">{{ m }}</option>
+      </select>
+    </div>
+
+    <main class="main">
       <!-- empty state with predefined prompts -->
-      <section v-if="messages.length === 0" class="welcome">
-        <h2>What would you like to compute?</h2>
-        <div class="suggestions">
-          <button v-for="p in SUGGESTIONS" :key="p" class="suggestion" @click="send(p)">{{ p }}</button>
-        </div>
-      </section>
-
-      <!-- conversation -->
-      <section v-else class="thread">
-        <template v-for="(m, i) in messages" :key="i">
-          <div v-if="m.role === 'user'" class="user">{{ m.text }}</div>
-
-          <div v-else class="assistant">
-            <p v-if="loading && i === messages.length - 1 && m.steps.length === 0" class="say muted">Thinking…</p>
-
-            <template v-for="(s, j) in m.steps" :key="j">
-              <div v-if="s.kind === 'text' && s.text.trim()" class="say md" v-html="s.html"></div>
-
-              <div v-else-if="s.kind === 'tool'" class="tool">
-                <div class="tool-head">
-                  <span class="badge wasm_interpreter">⚡ Wasm interpreter</span>
-                  <span class="lang">{{ s.language }}</span>
-                  <span class="meta">{{ metaLabel(s) }}</span>
-                </div>
-                <!-- Extra npm packages bundled in + outbound hosts the model allow-listed for this run. -->
-                <div
-                  v-if="(s.packages && Object.keys(s.packages).length) || (s.allowedHosts && s.allowedHosts.length)"
-                  class="tool-deps"
-                >
-                  <span v-for="(ver, name) in (s.packages || {})" :key="'p' + name" class="chip pkg" title="npm package bundled in">
-                    <span class="chip-ico">📦</span>{{ name }}<span class="chip-ver">{{ ver }}</span>
-                  </span>
-                  <span v-for="h in (s.allowedHosts || [])" :key="'h' + h" class="chip host" title="allowed outbound host">
-                    <span class="chip-ico">🌐</span>{{ h }}
-                  </span>
-                </div>
-                <pre class="code"><code class="hljs" v-html="highlightCode(s.code, s.language)"></code></pre>
-                <pre v-if="s.stdout" class="out">{{ s.stdout }}</pre>
-                <pre v-if="s.stderr" class="out err">{{ s.stderr }}</pre>
-                <pre v-if="s.error" class="out err">⚠ {{ s.error }}</pre>
-              </div>
-            </template>
+      <div v-if="lanes[0].messages.length === 0" class="scroll">
+        <section class="welcome">
+          <h2>What would you like to compute?</h2>
+          <div class="suggestions">
+            <button v-for="p in SUGGESTIONS" :key="p" class="suggestion" :disabled="budgetExhausted" @click="send(p)">{{ p }}</button>
           </div>
-        </template>
+        </section>
+      </div>
 
-        <div v-if="error" class="assistant"><p class="say err">⚠ {{ error }}</p></div>
-      </section>
+      <!-- split comparison: the same prompt runs on every chosen model at once, each in its own pane -->
+      <div v-else class="split">
+        <section v-for="lane in lanes" :key="lane.id" class="pane">
+          <div class="pane-head">
+            <span class="model-tag" :class="laneClass(lane.id)">{{ lane.model }}</span>
+            <span v-if="laneUsage(lane)" class="usage-total" title="prompt + completion tokens, summed across this conversation">
+              Σ {{ fmtTokens(laneUsage(lane)!.total) }} tokens
+            </span>
+          </div>
+
+          <div class="scroll" :ref="(el) => setPaneRef(lane.id, el)">
+            <section class="thread">
+              <template v-for="(m, i) in lane.messages" :key="i">
+                <div v-if="m.role === 'user'" class="user">{{ m.text }}</div>
+
+                <div v-else class="assistant">
+                  <p v-if="lane.loading && i === lane.messages.length - 1 && m.steps.length === 0" class="say muted">Thinking…</p>
+
+                  <template v-for="(s, j) in m.steps" :key="j">
+                    <div v-if="s.kind === 'text' && s.text.trim()" class="say md" v-html="s.html"></div>
+
+                    <div v-else-if="s.kind === 'tool'" class="tool">
+                      <div class="tool-head">
+                        <span class="badge wasm_interpreter">⚡ Wasm interpreter</span>
+                        <span class="lang">{{ s.language }}</span>
+                        <span class="meta">{{ metaLabel(s) }}</span>
+                      </div>
+                      <!-- Extra npm packages bundled in + outbound hosts the model allow-listed for this run. -->
+                      <div
+                        v-if="(s.packages && Object.keys(s.packages).length) || (s.allowedHosts && s.allowedHosts.length)"
+                        class="tool-deps"
+                      >
+                        <span v-for="(ver, name) in (s.packages || {})" :key="'p' + name" class="chip pkg" title="npm package bundled in">
+                          <span class="chip-ico">📦</span>{{ name }}<span class="chip-ver">{{ ver }}</span>
+                        </span>
+                        <span v-for="h in (s.allowedHosts || [])" :key="'h' + h" class="chip host" title="allowed outbound host">
+                          <span class="chip-ico">🌐</span>{{ h }}
+                        </span>
+                      </div>
+                      <pre class="code"><code class="hljs" v-html="highlightCode(s.code, s.language)"></code></pre>
+                      <pre v-if="s.stdout" class="out">{{ s.stdout }}</pre>
+                      <pre v-if="s.stderr" class="out err">{{ s.stderr }}</pre>
+                      <pre v-if="s.error" class="out err">⚠ {{ s.error }}</pre>
+                    </div>
+                  </template>
+
+                  <p v-if="m.usage" class="say muted usage-meta">
+                    {{ fmtTokens(m.usage.input) }} in · {{ fmtTokens(m.usage.output) }} out ·
+                    {{ fmtTokens(m.usage.input + m.usage.output) }} total tokens
+                  </p>
+                </div>
+              </template>
+
+              <div v-if="lane.error" class="assistant"><p class="say err">⚠ {{ lane.error }}</p></div>
+            </section>
+          </div>
+        </section>
+      </div>
     </main>
 
     <footer class="composer">
       <textarea
         v-model="draft"
-        :disabled="loading"
+        :disabled="anyLoading || budgetExhausted"
         rows="1"
-        placeholder="Ask me to run some code…"
+        :placeholder="budgetExhausted ? 'Token budget exhausted — press Reset in the header to continue' : 'Ask me to run some code…'"
         @keydown.enter.exact.prevent="send()"
       />
-      <button class="send" :disabled="loading || !draft.trim()" @click="send()">Send</button>
+      <button class="send" :disabled="anyLoading || budgetExhausted || !draft.trim()" @click="send()">Send</button>
     </footer>
 
     <!-- How it works: the generate → execute → observe loop -->
@@ -105,9 +167,15 @@
           network unless a request allows it, and near-instant to start (milliseconds, no
           container cold-start), so running fresh code on every request stays cheap.
         </p>
+        <p class="help-lede">
+          Every question runs on <strong>up to three models at once</strong> — pick the
+          count with the "Compare" buttons — each in its own pane with its own dropdown,
+          so you can compare how the models your server offers write and reason about the
+          same code side by side.
+        </p>
 
         <div class="diagram">
-          <svg viewBox="0 0 720 250" role="img" :aria-label="`A loop: you ask, ${llmName} writes code, a private Wasm sandbox runs it, the output feeds back to ${llmName}, which answers.`">
+          <svg viewBox="0 0 720 250" role="img" aria-label="A loop: you ask, each model writes code, a private Wasm sandbox runs it, the output feeds back to the model, which answers.">
             <defs>
               <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                 <path d="M0 0 L10 5 L0 10 z" fill="#9aa0a8" />
@@ -134,7 +202,7 @@
             <text x="64" y="155" text-anchor="middle" font-size="14" fill="#1f2328" font-weight="600">You</text>
 
             <rect x="176" y="120" width="150" height="60" rx="12" fill="#eef4ff" stroke="#c7d7fe" />
-            <text x="251" y="146" text-anchor="middle" font-size="13.5" fill="#1d4ed8" font-weight="700">{{ llmName }}</text>
+            <text x="251" y="146" text-anchor="middle" font-size="13.5" fill="#1d4ed8" font-weight="700">Each model</text>
             <text x="251" y="165" text-anchor="middle" font-size="12" fill="#3b5bdb">writes code</text>
 
             <rect x="390" y="120" width="170" height="60" rx="12" fill="#ecfdf5" stroke="#a7f3d0" />
@@ -153,13 +221,13 @@
             <div><strong>You ask.</strong> A question goes into the chat.</div>
           </li>
           <li><span class="n">2</span>
-            <div><strong>{{ llmName }} writes code.</strong> It picks Python or JavaScript and produces a small program.</div>
+            <div><strong>Each model writes code.</strong> It picks Python or JavaScript and produces a small program.</div>
           </li>
           <li><span class="n">3</span>
             <div><strong>A private Wasm sandbox runs it.</strong> The code executes in an isolated WebAssembly interpreter: no filesystem, no shell, default-deny network.</div>
           </li>
           <li><span class="n">4</span>
-            <div><strong>The output loops back.</strong> stdout, stderr and errors return to {{ llmName }}, which fixes-and-reruns or, once satisfied, writes the final answer.</div>
+            <div><strong>The output loops back.</strong> stdout, stderr and errors return to the model, which fixes-and-reruns or, once satisfied, writes the final answer.</div>
           </li>
         </ol>
 
@@ -180,7 +248,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, nextTick } from "vue";
+import { ref, reactive, computed, nextTick } from "vue";
 import MarkdownIt from "markdown-it";
 import hljs from "highlight.js/lib/core";
 import javascript from "highlight.js/lib/languages/javascript";
@@ -311,8 +379,42 @@ type Step =
       running: boolean;
     };
 
-type Assistant = { role: "assistant"; steps: Step[] };
+// Token usage for the turns it took to answer one prompt (an agentic run can take more
+// than one model turn when it calls the tool more than once), reported once the answer
+// is done; see the `done` WireEvent in api/src/index.ts.
+type Usage = { input: number; output: number };
+type Assistant = { role: "assistant"; steps: Step[]; usage?: Usage };
 type Msg = { role: "user"; text: string } | Assistant;
+
+function fmtTokens(n: number): string {
+  return n.toLocaleString();
+}
+
+// ---- shared token budget ----
+// One pot for the whole session: every lane's input + output tokens count against it, so
+// comparing two models burns it twice as fast. It is deliberately *not* derived from the
+// lanes' messages (unlike laneUsage below): "New Chat" clears those, but spent tokens
+// stay spent. Only the header's Reset button refills it. In-memory only, so a page
+// reload also starts fresh. When exhausted, sending is blocked (the composer and the
+// suggestion buttons disable); an in-flight run still finishes and its usage is counted,
+// so the meter can overshoot the budget.
+const TOKEN_BUDGET = 10_000;
+const budgetUsed = ref(0);
+const budgetExhausted = computed(() => budgetUsed.value >= TOKEN_BUDGET);
+const budgetPct = computed(() => Math.min(100, (budgetUsed.value / TOKEN_BUDGET) * 100));
+function resetBudget() {
+  if (anyLoading.value) return;
+  budgetUsed.value = 0;
+}
+
+// Two independent conversations run side by side, each pinned to a model id the user
+// picks from a dropdown. The dropdown's options come from GET /api/models (the server
+// behind `model_base_url`), not a hardcoded list, so it reflects whatever that server
+// actually serves. Lanes are identified by a fixed `id` (not the model, which the user
+// can change, including to the same model as the other lane).
+function laneClass(id: number): string {
+  return `lane-${id}`;
+}
 
 type TextStep = Extract<Step, { kind: "text" }>;
 
@@ -353,14 +455,82 @@ const SUGGESTIONS = [
   "Parse a CSV of employees and print the average salary",
 ];
 
-const messages = ref<Msg[]>([]); // display transcript
-const history = ref<unknown>(null); // provider-tagged model history, round-tripped to continue the conversation
-const llmName = ref("The model"); // set from /api/health
+// One independent conversation per lane: own transcript, own round-tripped history, own
+// loading/error state, so each runs (and can fail) without affecting the others. `model`
+// starts empty and is filled in once GET /api/models resolves (see loadModels below).
+type Lane = {
+  id: number;
+  model: string;
+  messages: Msg[];
+  history: unknown;
+  loading: boolean;
+  error: string;
+};
+
+// How many models to compare at once (1-2), chosen via the "Compare" buttons. Changing it
+// rebuilds the lane list from scratch: a different count is a different comparison, so
+// there is no sane way to carry an old conversation over.
+const laneCount = ref(2);
+const lanes = reactive<Lane[]>([]);
+const anyLoading = computed(() => lanes.some((l) => l.loading));
+// Once a comparison has a first message, lock the count and model pickers so you can't
+// silently swap a model (or the number of panes) mid-conversation; "New Chat" (reset)
+// clears every lane's messages, which unlocks them again.
+const hasStarted = computed(() => lanes[0]?.messages.length > 0);
+
+// Populated from GET /api/models; each lane's <select> lists these.
+const availableModels = ref<string[]>([]);
+const modelsError = ref("");
+
+// Defaults each unset lane to a distinct model (cycling if the server serves fewer models
+// than lanes). Called once models load, and again whenever the lane count changes.
+function assignDefaultModels() {
+  if (!availableModels.value.length) return;
+  lanes.forEach((lane, i) => {
+    if (!lane.model) lane.model = availableModels.value[i % availableModels.value.length];
+  });
+}
+
+function buildLanes(n: number) {
+  lanes.splice(0, lanes.length);
+  for (let id = 0; id < n; id++) {
+    lanes.push({ id, model: "", messages: [], history: null, loading: false, error: "" });
+  }
+  assignDefaultModels();
+}
+function setLaneCount(n: number) {
+  if (n === laneCount.value || anyLoading.value) return;
+  laneCount.value = n;
+  buildLanes(n);
+}
+buildLanes(laneCount.value);
+
+async function loadModels() {
+  try {
+    const resp = await fetch("/api/models");
+    // The response may not be JSON at all (e.g. a stale build predating this route, or an
+    // upstream error page), so parse defensively instead of letting a SyntaxError surface
+    // as the error message.
+    const d = await resp.json().catch(() => null);
+    if (!resp.ok || !d || !Array.isArray(d.models) || d.models.length === 0) {
+      throw new Error(d?.error || `could not load models (${resp.status})`);
+    }
+    availableModels.value = d.models;
+    assignDefaultModels();
+  } catch (e: any) {
+    modelsError.value = String(e?.message ?? e);
+  }
+}
+
 const draft = ref("");
-const loading = ref(false);
-const error = ref("");
-const scrollEl = ref<HTMLElement | null>(null);
 const showHelp = ref(false); // "How it works" overlay
+
+// Each pane scrolls independently; function refs key the live elements by lane id (not the
+// model, which the user can change, including to the same model as the other lane).
+const paneRefs: Record<number, HTMLElement | null> = {};
+function setPaneRef(id: number, el: unknown) {
+  paneRefs[id] = (el as HTMLElement) ?? null;
+}
 
 // ---- access-token gate ----
 const gate = ref<"checking" | "locked" | "open">("checking");
@@ -371,11 +541,11 @@ const gateError = ref("");
 async function checkAuth() {
   try {
     const d = await (await fetch("/api/health")).json();
-    llmName.value = d.provider === "anthropic" ? "Claude" : "The model";
     gate.value = !d.authRequired || d.authed ? "open" : "locked";
   } catch {
     gate.value = "open"; // health unreachable, don't hard-lock local dev
   }
+  if (gate.value === "open") loadModels();
 }
 async function submitToken() {
   const t = token.value.trim();
@@ -388,8 +558,12 @@ async function submitToken() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: t }),
     });
-    if (r.ok) gate.value = "open";
-    else gateError.value = "Invalid access token";
+    if (r.ok) {
+      gate.value = "open";
+      loadModels();
+    } else {
+      gateError.value = "Invalid access token";
+    }
   } catch {
     gateError.value = "Could not verify. Try again.";
   } finally {
@@ -408,21 +582,27 @@ function metaLabel(s: Extract<Step, { kind: "tool" }>): string {
   return `generated in ${fmt(s.genMs)} · ran in ${fmt(s.execMs)}`;
 }
 
-async function toBottom() {
+async function toBottom(laneId: number) {
   await nextTick();
-  scrollEl.value?.scrollTo({ top: scrollEl.value.scrollHeight, behavior: "smooth" });
+  const el = paneRefs[laneId];
+  el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
 }
 
 function reset() {
-  messages.value = [];
+  for (const lane of lanes) {
+    lane.messages = [];
+    lane.history = null; // forget the prior conversation
+    lane.error = "";
+  }
   draft.value = "";
-  error.value = "";
-  history.value = null; // forget the prior conversation
 }
 
-// Apply one streamed NDJSON event to the live assistant message.
+// Apply one streamed NDJSON event to the live assistant message. The `model` event just
+// confirms which model this pane's request was pinned to, so there is nothing to do with it.
 function apply(a: Assistant, ev: any) {
-  if (ev.t === "text_delta") {
+  if (ev.t === "model") {
+    // no-op: the pane already knows its model
+  } else if (ev.t === "text_delta") {
     // Append to the live text block, or start a new one, so the model's text
     // grows on screen token-by-token as it is received.
     let s = a.steps.find((x) => x.kind === "text" && x.block === ev.block) as TextStep | undefined;
@@ -462,30 +642,56 @@ function apply(a: Assistant, ev: any) {
     }
   } else if (ev.t === "error") {
     finalizeText(a);
-    error.value = ev.error;
+    throw new Error(ev.error);
   } else if (ev.t === "done") {
     finalizeText(a); // the turn is over, settle the final text without a caret
-    if (ev.history) history.value = ev.history; // carry context to the next turn
+    if (ev.usage) {
+      a.usage = ev.usage;
+      budgetUsed.value += ev.usage.input + ev.usage.output;
+    }
   }
 }
 
+// Sums every assistant turn's usage in a lane, so the pane header shows a running total
+// for the whole conversation, not just the latest answer. Returns null until there's any.
+function laneUsage(lane: Lane): { input: number; output: number; total: number } | null {
+  let input = 0;
+  let output = 0;
+  let any = false;
+  for (const m of lane.messages) {
+    if (m.role === "assistant" && m.usage) {
+      input += m.usage.input;
+      output += m.usage.output;
+      any = true;
+    }
+  }
+  return any ? { input, output, total: input + output } : null;
+}
+
+// Send the same prompt to every lane at once, in parallel, each continuing its own
+// conversation (own history, own failure mode) so the answers are directly comparable.
 async function send(text?: string) {
   const prompt = (text ?? draft.value).trim();
-  if (!prompt || loading.value) return;
+  if (!prompt || anyLoading.value || budgetExhausted.value) return;
   draft.value = "";
-  error.value = "";
-  messages.value.push({ role: "user", text: prompt });
-  loading.value = true;
-  await toBottom();
+  for (const lane of lanes) {
+    lane.error = "";
+    lane.messages.push({ role: "user", text: prompt });
+  }
+  await Promise.all(lanes.map((lane) => runLane(lane, prompt)));
+}
 
+async function runLane(lane: Lane, prompt: string) {
+  lane.loading = true;
   const assistant = reactive<Assistant>({ role: "assistant", steps: [] });
-  messages.value.push(assistant);
+  lane.messages.push(assistant);
+  await toBottom(lane.id);
 
   try {
     const resp = await fetch("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prompt, history: history.value }),
+      body: JSON.stringify({ prompt, history: lane.history, model: lane.model }),
     });
     if (!resp.ok || !resp.body) {
       const data = await resp.json().catch(() => ({}));
@@ -505,16 +711,18 @@ async function send(text?: string) {
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
         if (!line) continue;
-        apply(assistant, JSON.parse(line));
-        await toBottom();
+        const ev = JSON.parse(line);
+        if (ev.t === "done" && ev.history) lane.history = ev.history; // carry context to the next turn
+        apply(assistant, ev);
+        await toBottom(lane.id);
       }
     }
   } catch (e: any) {
-    error.value = String(e?.message ?? e);
+    lane.error = String(e?.message ?? e);
   } finally {
-    loading.value = false;
+    lane.loading = false;
     finalizeText(assistant); // settle any text whose stream ended without a done event
-    await toBottom();
+    await toBottom(lane.id);
   }
 }
 </script>
@@ -532,19 +740,40 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sa
 .actions { display: flex; align-items: center; gap: 16px; }
 .ghost { background: #fff; border: 1px solid #e2e2e2; border-radius: 8px; padding: 7px 14px; font-size: 14px; cursor: pointer; }
 .ghost:hover { background: #f6f6f6; }
+.ghost:disabled { cursor: not-allowed; opacity: 0.6; }
 
-.scroll { flex: 1; overflow-y: auto; }
+/* shared token budget meter */
+.budget { display: flex; align-items: center; gap: 8px; }
+.budget-label { font-size: 12.5px; color: #8a8f98; font-weight: 600; }
+.budget-bar { width: 110px; height: 7px; border-radius: 999px; background: #eef0f2; overflow: hidden; }
+.budget-fill { display: block; height: 100%; border-radius: 999px; background: #15803d; transition: width 0.3s ease; }
+.budget.over .budget-fill { background: #b42318; }
+.budget-nums { font-size: 12px; color: #5a6069; font-variant-numeric: tabular-nums; }
+.budget.over .budget-nums { color: #b42318; font-weight: 600; }
+.budget-reset { padding: 4px 10px; font-size: 12.5px; }
+
+.main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.scroll { flex: 1; min-height: 0; overflow-y: auto; }
 .welcome { max-width: 620px; margin: 9vh auto 0; text-align: center; padding: 0 20px; }
 .welcome h2 { font-weight: 600; color: #3a3f45; }
 .suggestions { display: flex; flex-direction: column; gap: 12px; margin-top: 28px; }
 .suggestion { text-align: left; background: #fff; border: 1px solid #e7e7e7; border-radius: 12px; padding: 16px 18px; font-size: 15px; cursor: pointer; }
-.suggestion:hover { border-color: #cfcfcf; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+.suggestion:hover:not(:disabled) { border-color: #cfcfcf; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+.suggestion:disabled { cursor: not-allowed; opacity: 0.6; }
 
-.thread { max-width: 760px; margin: 0 auto; padding: 24px 20px 8px; display: flex; flex-direction: column; gap: 16px; }
+/* split comparison: two independently-scrolling panes, one per model */
+.split { flex: 1; min-height: 0; display: flex; }
+.pane { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid #ececec; }
+.pane:last-child { border-right: none; }
+.pane-head { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid #ececec; background: #fff; }
+.usage-total { font-size: 11.5px; color: #8a8f98; font-variant-numeric: tabular-nums; }
+
+.thread { padding: 20px 20px 8px; display: flex; flex-direction: column; gap: 16px; }
 .user { align-self: flex-end; background: #1f2328; color: #fff; padding: 10px 14px; border-radius: 14px 14px 4px 14px; max-width: 80%; white-space: pre-wrap; }
 .assistant { display: flex; flex-direction: column; gap: 12px; max-width: 92%; }
 .say { margin: 0; line-height: 1.55; white-space: pre-wrap; }
 .say.muted { color: #8a8f98; }
+.usage-meta { font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .say.err, .out.err { color: #b42318; }
 .cursor { color: #6b7280; font-weight: 600; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -573,6 +802,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sa
 /* fenced code block */
 .md pre.hl { margin: 0 0 10px; border: 1px solid #ececec; border-radius: 10px; overflow: hidden; background: #f8fafc; }
 .md pre.hl code.hljs { background: #f8fafc; padding: 12px 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.5; }
+
+.model-bar { display: flex; align-items: center; gap: 10px; padding: 10px 22px; border-bottom: 1px solid #ececec; background: #fff; }
+.lane-count { display: flex; align-items: center; gap: 6px; margin-right: 6px; }
+.lane-count-label { font-size: 12.5px; color: #8a8f98; font-weight: 600; }
+.count-btn { width: 26px; height: 26px; border-radius: 8px; border: 1px solid #e2e2e2; background: #fff; font-size: 12.5px; font-weight: 700; color: #3a3f45; cursor: pointer; }
+.count-btn:hover:not(:disabled) { background: #f6f6f6; }
+.count-btn.active { background: #1f2328; color: #fff; border-color: #1f2328; }
+.count-btn:disabled { cursor: not-allowed; opacity: 0.6; }
+.model-tag, .model-select { font-size: 11.5px; font-weight: 700; letter-spacing: 0.02em; padding: 3px 10px; border-radius: 999px; border: 1px solid transparent; }
+.model-tag { align-self: flex-start; }
+.model-select { padding-right: 24px; font-family: inherit; cursor: pointer; appearance: none; background-repeat: no-repeat; background-position: right 8px center; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238a8f98'/%3E%3C/svg%3E"); }
+.model-select:disabled { cursor: default; opacity: 0.7; }
+.model-tag.lane-0, .model-select.lane-0 { background-color: #eafbea; color: #15803d; border-color: #c9f0cc; }
+.model-tag.lane-1, .model-select.lane-1 { background-color: #f3ecfd; color: #7e22ce; border-color: #e3d4fb; }
+.model-tag.lane-2, .model-select.lane-2 { background-color: #fff4e5; color: #b45309; border-color: #fde3b8; }
 
 .tool { border: 1px solid #e7e7e7; border-radius: 12px; overflow: hidden; background: #fff; }
 .tool-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid #f0f0f0; background: #fbfbfb; }

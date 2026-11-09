@@ -70,11 +70,17 @@ by turn.
 - `{"t":"tool_end", id, execMs, stdout, stderr, error}`: the output, the moment the
   sandbox returns (`genMs` is the model turn latency that produced the code, `execMs`
   the interpreter run).
-- `{"t":"done", history}` / `{"t":"error"}`. `history` is the provider-tagged
-  conversation the UI sends back to continue it.
+- `{"t":"model", model}`: the model id this run is pinned to (or the provider's default),
+  sent once before anything else.
+- `{"t":"done", history, usage}` / `{"t":"error"}`. `history` is the provider-tagged
+  conversation the UI sends back to continue it; `usage` is `{input, output}` token
+  counts summed across every model turn it took to answer the prompt (an agentic run can
+  take more than one turn when the model calls the tool more than once).
 
-Each tool card shows "generated in" (`genMs`) and "ran in" (`execMs`). Spin/StarlingMonkey forwards a guest streaming
-body chunk by chunk, which is what makes the incremental flush work.
+Each tool card shows "generated in" (`genMs`) and "ran in" (`execMs`); each assistant
+answer shows its token usage, and each pane header a running total for the conversation.
+Spin/StarlingMonkey forwards a guest streaming body chunk by chunk, which is what makes
+the incremental flush work.
 
 ### Markdown + syntax highlighting
 
@@ -102,18 +108,32 @@ Both builds read the same variables: the profile picks the API format, `model_ba
 picks the server. It is also the `api` component's outbound allow-list entry, so either
 build can target any compatible server.
 
+### Comparing models side by side
+
+Within that one provider build, the UI runs an A/B comparison across 1-2 models,
+chosen with the "Compare" buttons. `GET /api/models` reports the model ids the server
+behind `model_base_url` actually serves (via each provider's `listModels()` in
+[`api/src/llm/`](api/src/llm)), and `ui/pages/index.vue` shows one dropdown per pane,
+populated from that list, so you pick which models to compare. Every prompt is sent to
+`/api/chat` once per pane in parallel, each pinned to that pane's chosen model (the
+`model` field in the request body), and rendered as independent, labeled, side-by-side
+panes with their own conversation history. Changing the pane count starts a fresh
+comparison (there is no sane way to carry an old conversation across a different number
+of panes). A request without a `model` falls back to a hardcoded default in
+[`api/src/llm/`](api/src/llm) (`claude-opus-4-8` or `gpt-5`), which keeps the endpoint
+usable for direct API callers that only want one answer.
+
 ## Configuration (Spin application variables)
 
 | Variable | Default | Notes |
 |---|---|---|
 | `model_base_url` | (required) | origin (no path) of the model server, `SPIN_VARIABLE_MODEL_BASE_URL=<model-base-url>`; also the `api` component's outbound allow-list entry |
 | `model_api_key` | empty (secret) | `SPIN_VARIABLE_MODEL_API_KEY=<api-key>`, the key for the model server |
-| `model` | empty | empty = `claude-opus-4-8` (Anthropic) or `gpt-5` (OpenAI) |
 | `ts_interpreter_url` | `http://ts-sandbox.spin.internal` | the private JS/TS interpreter component |
 | `py_interpreter_url` | `http://py-sandbox.spin.internal` | the private Python interpreter component |
 | `bundler_url` | `http://bundler.spin.internal` | the private experimental bundler component |
 | `log_level` | `info` | `error`, `warn`, `info`, `debug`, or `trace` |
-| `access_token` | empty = **open** | set `SPIN_VARIABLE_ACCESS_TOKEN=…` to gate the UI + API behind an access-token page. Leave it empty only on a machine nobody else can reach: an open instance lets anyone spend your model key |
+| `access_token` | (required, secret) | `SPIN_VARIABLE_ACCESS_TOKEN=<secret>`; gates the UI + API behind an access-token page. Required so the app can't start open to anyone who can reach it |
 | `esm_base_url` | `https://esm.sh` | origin of the esm.sh server used by the experimental bundler for the model's npm `dependencies`; point it at a [self-hosted instance](https://github.com/esm-dev/esm.sh/blob/main/HOSTING.md) if you prefer |
 
 The interpreter URLs default to service chaining, so nothing needs to run separately;
@@ -127,9 +147,11 @@ Everything is one app, with no separate interpreter to start.
 1. Build: `spin build` (add `--profile openai` for the OpenAI build) builds all five components: the API (esbuild + `j2w`), the UI
    (`nuxt generate`), the two private interpreters, and the private bundler (this
    repo's components, built in place from `../../`).
-2. Run (the model server and key come from the environment):
+2. Run (the model server, key, and access token come from the environment; `access_token`
+   is required, so `spin up` fails fast without it):
    ```bash
    export SPIN_VARIABLE_MODEL_BASE_URL=<model-base-url> SPIN_VARIABLE_MODEL_API_KEY=<api-key>
+   export SPIN_VARIABLE_ACCESS_TOKEN=<secret>
    spin up                    # Anthropic Messages API
    spin up --profile openai   # OpenAI Chat Completions API
    ```
@@ -148,10 +170,14 @@ ignores the API key, so either build runs without a cloud account:
 
 ```bash
 ollama pull qwen3:4b
-export SPIN_VARIABLE_MODEL_BASE_URL=http://localhost:11434 SPIN_VARIABLE_MODEL=qwen3:4b
+export SPIN_VARIABLE_MODEL_BASE_URL=http://localhost:11434
+export SPIN_VARIABLE_ACCESS_TOKEN=<secret>
 spin up --build                    # Anthropic Messages API
 spin up --profile openai --build   # OpenAI Chat Completions API
 ```
+
+Pick `qwen3:4b` from the model dropdown in the UI (populated from Ollama's own model
+list via `GET /api/models`).
 
 Small local models are slower and less reliable at multi-step tool use than hosted
 ones.
@@ -163,8 +189,8 @@ model lists hosts in `allowedHosts`, and no storage unless it sets `kvEnabled`. 
 sets the access cookie `HttpOnly` (and `Secure` over HTTPS) and rejects `/api/*`
 requests from other origins. Before deploying:
 
-1. Set `access_token`. With it empty the instance is open (the api logs a warning on
-   every chat).
+1. `access_token` is a required variable, so the app refuses to start without one — pick a
+   long random secret for `SPIN_VARIABLE_ACCESS_TOKEN` in any environment others can reach.
 2. Block private networks at the host. The guard refuses private IP literals and
    internal names, but an allowed hostname that resolves to a private or loopback
    address (for example `127.0.0.1.nip.io`) still connects. With Spin, pass a runtime
