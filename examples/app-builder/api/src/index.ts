@@ -434,6 +434,18 @@ app.get("/api/apps/:id", async (c: Context) => {
   return c.json({ ...rec, convo });
 });
 
+// Remove a stored app: its code record, index entry, and saved conversation.
+app.delete("/api/apps/:id", async (c: Context) => {
+  const { store, convos } = makeStore();
+  const id = c.req.param("id") ?? "";
+  const rec = await store.get(id);
+  if (!rec) return c.json({ error: "not found" }, 404);
+  await store.delete(id);
+  await convos.delete(id);
+  log.info(`deleted app id=${id}`);
+  return c.json({ ok: true });
+});
+
 // Persist an app's conversation (display transcript + model history). Stored opaquely.
 app.put("/api/apps/:id/convo", async (c: Context) => {
   const { convos } = makeStore();

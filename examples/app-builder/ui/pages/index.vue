@@ -31,16 +31,13 @@
       <aside class="sidebar">
         <button class="newbtn" :class="{ active: activeId === null }" @click="newApp">＋ New app</button>
         <div class="applist">
-          <button
-            v-for="a in apps"
-            :key="a.id"
-            class="applink"
-            :class="{ active: a.id === activeId }"
-            @click="openEdit(a)"
-          >
-            <span class="badge" :class="a.language">{{ shortLang(a.language) }}</span>
-            <span class="applink-title">{{ a.title || a.id }}</span>
-          </button>
+          <div v-for="a in apps" :key="a.id" class="applink-row" :class="{ active: a.id === activeId }">
+            <button class="applink" @click="openEdit(a)">
+              <span class="badge" :class="a.language">{{ shortLang(a.language) }}</span>
+              <span class="applink-title">{{ a.title || a.id }}</span>
+            </button>
+            <button class="applink-del" title="Delete app" aria-label="Delete app" @click.stop="deleteApp(a)">×</button>
+          </div>
           <p v-if="!apps.length" class="side-empty">No apps yet. Build one.</p>
         </div>
       </aside>
@@ -378,6 +375,21 @@ async function toBottom() {
   scrollEl.value?.scrollTo({ top: scrollEl.value.scrollHeight, behavior: "smooth" });
 }
 
+// Delete a stored app (code + conversation). Confirms first since this can't be undone;
+// drops it from the gallery and, if it was open, returns to the "new app" state.
+async function deleteApp(a: AppMeta) {
+  if (!confirm(`Delete "${a.title || a.id}"? This can't be undone.`)) return;
+  try {
+    const r = await fetch(`/api/apps/${a.id}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(((await r.json().catch(() => ({}))) as any)?.error || `request failed (${r.status})`);
+  } catch (e: any) {
+    error.value = String(e?.message ?? e);
+    return;
+  }
+  apps.value = apps.value.filter((x) => x.id !== a.id);
+  if (activeId.value === a.id) newApp();
+}
+
 async function loadApps() {
   try {
     const r = await fetch("/api/apps");
@@ -601,10 +613,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sa
 .newbtn { text-align: left; background: #1f2328; color: #fff; border: none; border-radius: 10px; padding: 10px 12px; font-size: 14px; cursor: pointer; }
 .newbtn.active { background: #1d4ed8; }
 .applist { display: flex; flex-direction: column; gap: 4px; }
-.applink { display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; border: none; border-radius: 8px; padding: 9px 10px; font-size: 14px; cursor: pointer; color: #2a2f36; }
-.applink:hover { background: #f4f5f7; }
-.applink.active { background: #eef4ff; }
+.applink-row { display: flex; align-items: center; border-radius: 8px; }
+.applink-row:hover { background: #f4f5f7; }
+.applink-row.active { background: #eef4ff; }
+.applink { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; border: none; border-radius: 8px; padding: 9px 10px; font-size: 14px; cursor: pointer; color: #2a2f36; }
 .applink-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.applink-del { flex: 0 0 auto; border: none; background: transparent; color: #9aa0a8; font-size: 15px; line-height: 1; padding: 6px 9px; margin-right: 4px; cursor: pointer; border-radius: 6px; opacity: 0; }
+.applink-row:hover .applink-del { opacity: 1; }
+.applink-del:hover { color: #b42318; background: #fde2e1; }
 .side-empty { color: #9aa0a8; font-size: 13px; padding: 6px 10px; }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
